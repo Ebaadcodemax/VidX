@@ -1,0 +1,10 @@
+runtime:
+  maxRunCostUsd: 0.05
+  defaultOutputDirectory: runs
+
+# Provider prices are intentionally empty until a provider is selected and
+# its current published pricing has been reviewed. Add rates per model here.
+pricing: {}
+
+# Enable a model integration only after approval, credentials, and terms review.
+requiredEnv: []
