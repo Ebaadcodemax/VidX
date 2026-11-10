@@ -48,4 +48,40 @@ describe("local M1 media pipeline", () => {
     await mkdir(outputPath);
     await expect(runLocalPipeline(inputPath, outputPath, await loadConfig())).rejects.toThrow("already exists");
   });
+
+  it("resumes a complete run only after validating source and audio hashes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "vclip-resume-test-"));
+    tempDirs.push(directory);
+    const inputPath = join(directory, "fixture.mp4");
+    const outputPath = join(directory, "run");
+    await execFileAsync("ffmpeg", [
+      "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+      "-f", "lavfi", "-i", "testsrc=size=320x240:rate=24:duration=2",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+      "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", inputPath,
+    ], { timeout: 30_000 });
+    const config = await loadConfig();
+    await runLocalPipeline(inputPath, outputPath, config);
+    const resumed = await runLocalPipeline(inputPath, outputPath, config, { resume: true });
+    expect(resumed.resumed).toBe(true);
+    await writeFile(resumed.audioPath, "corrupt");
+    await expect(runLocalPipeline(inputPath, outputPath, config, { resume: true })).rejects.toThrow("audio.wav is missing or has changed");
+  });
+
+  it("refuses to resume artifacts against a changed source file", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "vclip-resume-hash-test-"));
+    tempDirs.push(directory);
+    const inputPath = join(directory, "fixture.mp4");
+    const outputPath = join(directory, "run");
+    await execFileAsync("ffmpeg", [
+      "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+      "-f", "lavfi", "-i", "testsrc=size=320x240:rate=24:duration=2",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+      "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", inputPath,
+    ], { timeout: 30_000 });
+    const config = await loadConfig();
+    await runLocalPipeline(inputPath, outputPath, config);
+    await writeFile(inputPath, "changed source");
+    await expect(runLocalPipeline(inputPath, outputPath, config, { resume: true })).rejects.toThrow("source file hash differs");
+  });
 });

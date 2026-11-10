@@ -31,6 +31,7 @@ export const costRecordSchema = z.object({
   localProcessing: z.object({
     sourceDurationSeconds: z.number().nonnegative(),
     audioExtractMs: z.number().nonnegative().optional(),
+    retryCount: z.number().int().nonnegative().optional(),
     note: z.string(),
   }).strict(),
 }).strict();

@@ -19,6 +19,15 @@ npm run cli -- init
 
 `init` checks Node, FFmpeg, FFprobe, and any environment variable names explicitly listed in `config.yaml`. Never put real keys in source control; `.env` is ignored.
 
+## Quick start (M6)
+
+1. Install Node.js 22.18+, FFmpeg and FFprobe, then run `npm install`.
+2. Check local tools with `npm run cli -- init`.
+3. Probe one creator-provided file with `npm run cli -- run "C:\path\to\video.mp4"`.
+4. For multiple inputs, use batch below. Outputs default to `C:\vclip-data\runs`; batch refuses an output location outside `C:\vclip-data`.
+
+The current `run` and `batch` commands cover the implemented local M1 stages: source probing and normalized audio extraction. They do **not** automatically run ASR, AI planning, rendering or review; those remain separate commands below. Batch makes no provider calls and needs no API key.
+
 ## Run media probing (M1)
 
 ```powershell
@@ -32,6 +41,38 @@ The command creates a new directory beneath `runs/` with:
 - `cost.json`: provider-call estimate and local processing timing. M1 makes no provider calls, so provider cost is zero; local compute time is recorded but not priced.
 
 Use `--out <new-directory>` to choose an output directory. The command refuses to overwrite an existing directory. On failure, it writes `failure.json` when possible.
+
+To resume a partial run, pass the same source and run directory back with `--resume`:
+
+```powershell
+npm run cli -- run "C:\path\to\video.mp4" --out "C:\vclip-data\runs\my-run" --resume
+```
+
+Resume recomputes the source hash and validates the saved checkpoint and extracted WAV before reuse. A changed source, missing/corrupt completed WAV, invalid checkpoint, or mismatched manifest is refused with an explanation; start a fresh run instead. A fully completed matching run is returned without re-extracting audio.
+
+## Batch processing (M6)
+
+```powershell
+npm run cli -- batch "C:\path\to\video-folder"
+```
+
+The folder is scanned recursively for `.mp4`, `.mov` and `.webm` files. Each is processed sequentially into its own uniquely named run folder under a new batch directory. A failure for one file is recorded with its stage and message in `batch.json`; later files still run. The command exits non-zero if any video failed, while printing every result. The batch directory and run directories are preserved; running without `--resume` creates new output and never overwrites prior results.
+
+Resume an interrupted batch by pointing to its existing output directory:
+
+```powershell
+npm run cli -- batch "C:\path\to\video-folder" --resume "C:\vclip-data\runs\batch_2026-11-10T12-00-00-000Z"
+```
+
+The prior `batch.json` maps source files to run directories. Partial runs are reopened only through the source-hash and artifact checks above; new files in the folder receive new run folders. Keep the source folder unchanged while resuming. Local FFmpeg extraction retries transient failures at most twice, with 250 ms then 500 ms backoff (capped at 1 second); invalid media and other permanent errors are reported immediately. M3 Gemini 429/503 retries continue to use configured cost reservations and retry limits. Batch itself makes no provider calls.
+
+### Troubleshooting
+
+- **No videos found:** check the folder path and use MP4, MOV or WebM.
+- **FFmpeg/FFprobe missing:** install them and ensure both are on `PATH`, then rerun `npm run cli -- init`.
+- **Stage failure:** open that video's `failure.json` and read its `stage` and `safeMessage`; `batch.json` also lists the failure.
+- **Resume refused:** do not replace or edit checkpoint files. Start a fresh run/batch so source and artifacts can be hashed together.
+- **One failed item:** other inputs continue. If the source file itself changes while fixing it, start a new batch; resume intentionally refuses changed source hashes.
 
 ```powershell
 npm run cli -- cost "runs\<run-directory>"
@@ -118,4 +159,4 @@ Tests create a short synthetic video with FFmpeg in a temporary directory; they 
 
 ## Current boundary
 
-This local CLI covers probing, transcription, clip proposal and criticism, validation, boundary snapping, captioned clip rendering, and local review/evaluation. It does not implement Creator DNA, access social platforms, generate visuals, provide a manual timeline editor, or run as a hosted service. Use only media you own or have written permission to process.
+This local CLI provides separate commands for probing/audio extraction, transcription, clip proposal and criticism, validation, boundary snapping, captioned clip rendering, local review/evaluation, and batch processing of the implemented probe/audio stage. It does not yet orchestrate these commands into one automatic full production run. It does not implement Creator DNA, access social platforms, generate visuals, provide a manual timeline editor, or run as a hosted service. Use only media you own or have written permission to process.

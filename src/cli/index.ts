@@ -1,9 +1,10 @@
 import { Command } from "commander";
 import { readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadConfig } from "../lib/config";
 import { runCommand } from "../lib/process";
 import { runLocalPipeline } from "../pipeline/run";
+import { runBatch } from "../pipeline/batch";
 import { runCompareAsr, runSingleTranscription } from "../pipeline/transcribe";
 import type { TranscriberId } from "../adapters/transcriber";
 import { costRecordSchema } from "../schemas/manifest";
@@ -41,14 +42,36 @@ program.command("run")
   .description("Probe one local media file and extract normalized audio")
   .argument("<media-file>", "Path to a creator-provided local media file")
   .option("--out <directory>", "New run directory; defaults to config.yaml setting")
-  .action(async (mediaFile: string, options: { out?: string }) => {
+  .option("--resume", "Resume a run directory created by an earlier vclip run")
+  .action(async (mediaFile: string, options: { out?: string; resume?: boolean }) => {
     const config = await loadConfig();
-    const result = await runLocalPipeline(mediaFile, options.out, config);
-    console.log(`Run complete: ${result.runDirectory}`);
+    assertUnderVclipData(options.out ?? config.runtime.defaultOutputDirectory);
+    const result = await runLocalPipeline(mediaFile, options.out, config, { resume: options.resume });
+    console.log(`${result.resumed ? "Run resumed" : "Run complete"}: ${result.runDirectory}`);
     console.log(`Duration: ${result.durationSeconds.toFixed(2)} seconds`);
     console.log(`Audio: ${result.audioPath}`);
     console.log(`Manifest: ${result.manifestPath}`);
     console.log("Estimated provider cost: $0.000000 (no provider calls in this milestone)");
+  });
+
+program.command("batch")
+  .description("Process supported local videos sequentially; failures are recorded per video")
+  .argument("<folder>", "Folder to scan recursively for MP4, MOV, and WebM files")
+  .option("--out <directory>", "New batch directory under C:/vclip-data; defaults to config.yaml output directory")
+  .option("--resume <directory>", "Resume the batch recorded in this existing batch directory")
+  .action(async (folder: string, options: { out?: string; resume?: string }) => {
+    const config = await loadConfig();
+    const output = resolve(options.resume ?? options.out ?? join(config.runtime.defaultOutputDirectory, `batch_${new Date().toISOString().replace(/[:.]/g, "-")}`));
+    assertUnderVclipData(output, "Batch");
+    const report = await runBatch(folder, output, config, { resume: Boolean(options.resume) });
+    console.log(`Batch report: ${join(report.runDirectory, "batch.json")}`);
+    for (const item of report.items) {
+      const message = item.status === "succeeded" ? `succeeded; run=${item.runDirectory}` : `FAILED at ${item.stage}: ${item.error}`;
+      console.log(`${item.sourceFile}: ${message}`);
+    }
+    const failed = report.items.filter((item) => item.status === "failed").length;
+    console.log(`Batch finished: ${report.items.length - failed} succeeded, ${failed} failed. Current run stage is local probe + audio extraction; ASR, planning, rendering, and review remain separate commands.`);
+    if (failed) process.exitCode = 1;
   });
 
 program.command("cost")
@@ -217,5 +240,14 @@ async function checkCommand(name: string, args: string[]): Promise<{ name: strin
     return { name, value: firstLine.trim() };
   } catch (error) {
     return { name, error: error instanceof Error ? error.message : "not available" };
+  }
+}
+
+function assertUnderVclipData(path: string, label = "Run"): void {
+  const safeRoot = resolve("C:/vclip-data");
+  const target = resolve(path);
+  const relativeTarget = relative(safeRoot, target);
+  if (relativeTarget === ".." || relativeTarget.startsWith(`..${sep}`) || isAbsolute(relativeTarget)) {
+    throw new Error(`${label} outputs must stay under ${safeRoot}; choose an output directory inside that folder.`);
   }
 }
