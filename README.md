@@ -1,6 +1,6 @@
 # vclip (pilot CLI)
 
-A small local pipeline for validating media ingestion and transcription before adding clip selection. M2 adds swappable local and hosted speech-to-text adapters; it still does not access YouTube/Instagram, select clips, or edit/render video.
+A small local pipeline for creator-provided media: ingestion, transcription, clip planning, rendering, and offline review/evaluation. It does not access YouTube/Instagram or provide a manual timeline editor.
 
 ## Requirements
 
@@ -87,6 +87,22 @@ Each render directory contains `render.json`, `cost.json`, and `ffmpeg-commands.
 
 This Windows setup uses the installed Nirmala UI system font, which covers Latin and Devanagari; the project does not bundle the font. Rendering is currently configured and tested on Windows; other operating systems need a platform-specific font path and family configuration before rendering.
 
+## Offline review and evaluation (M5)
+
+All review and evaluation data should stay outside the repository. Defaults use `C:\vclip-data`:
+
+```powershell
+npm run cli -- review "C:\vclip-data\runs\my-render" --edit-ir "C:\vclip-data\runs\my-plan\edit_ir.json" --transcript "C:\vclip-data\runs\my-transcription\transcript.json"
+npm run cli -- eval
+npm run cli -- purge "creator-or-run-id" --dry-run
+```
+
+`review.html` is a static offline page with relative rendered-clip paths. Keep the `clips/` folder with it when sharing or zipping. It does not embed the source video. The page downloads ratings as `ratings.csv`; `review.csv` is a blank plain-CSV fallback. Put completed rating CSVs in `C:\vclip-data\eval` and run `eval`; the Markdown report is written to `C:\vclip-data\eval\report.md`. Ratings include per-run and per-rater usable rates, sample sizes, and 95% Wilson intervals. Fewer than 20 ratings are explicitly marked as a small, directional sample. Production metrics are computed only when matching local run metadata exists.
+
+Blind comparisons use `review <render-run> --compare <competitor-folder>`. The folder must contain the same number of video clips as the run. Share only the generated `blind-review/` folder: both clips are copied under opaque asset names and shown as A/B in randomized order. The mapping is stored as `C:\vclip-data\blind-keys\<run-id>\key.json`, outside the shared folder; the sheet and answers use an opaque comparison ID. A/B answers download separately as `ab_ratings.csv`.
+
+`purge <creator-or-run>` first shows a dry-run with `--dry-run`; without it, the command asks for the exact confirmation word `DELETE`. It removes matching run folders and rows associated with those run IDs from evaluation CSVs, then appends a content-free audit record under `C:\vclip-data\audit`. Creator matching uses run-name prefixes or creator identifiers explicitly present in local run metadata. M5 makes no provider calls and processes no media/transcript with an external service.
+
 ## Config and cost accounting
 
 `config.yaml` sets a low default run cap and stores reviewed Gemini standard-tier estimates for transcription and reasoning. The default cap is `$0.05` per run. Hosted transcription preflights its estimate before audio upload; clip planning reserves estimated token cost before each model call. Local CPU time is reported but priced at zero. Update rates after checking current provider prices; cost estimates are not invoices.
@@ -102,4 +118,4 @@ Tests create a short synthetic video with FFmpeg in a temporary directory; they 
 
 ## Current boundary
 
-This local CLI now covers probing, transcription, clip proposal, critic review, validation, boundary snapping, and M4 clip rendering. It does not build the review/evaluation tools, implement Creator DNA, access social platforms, generate visuals, provide an editor timeline, or run as a hosted service. Use only media you own or have written permission to process.
+This local CLI covers probing, transcription, clip proposal and criticism, validation, boundary snapping, captioned clip rendering, and local review/evaluation. It does not implement Creator DNA, access social platforms, generate visuals, provide a manual timeline editor, or run as a hosted service. Use only media you own or have written permission to process.

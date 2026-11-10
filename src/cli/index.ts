@@ -9,6 +9,9 @@ import type { TranscriberId } from "../adapters/transcriber";
 import { costRecordSchema } from "../schemas/manifest";
 import { runClipPlanning } from "../pipeline/plan-clips";
 import { runRendering } from "../pipeline/render";
+import { createBlindReview, createReviewSheet, evaluate, planPurge, purge } from "../pipeline/review-eval";
+import { createInterface } from "node:readline/promises";
+import { stdin, stdout } from "node:process";
 
 const program = new Command();
 program
@@ -144,6 +147,60 @@ program.command("render")
       console.log(`${clip.id}: ${clip.videoPath}; ${clip.probe.streams.find((stream) => stream.codec_type === "video")?.width}x${clip.probe.streams.find((stream) => stream.codec_type === "video")?.height}; ${clip.durationSeconds.toFixed(3)}s; ${clip.elapsedMs}ms`);
     }
     console.log(`Elapsed: ${result.elapsedMs}ms; estimated direct service cost: $${result.estimatedCostUsd.toFixed(6)}`);
+  });
+
+program.command("review")
+  .description("Generate an offline clip review sheet (M5)")
+  .argument("<run-directory>", "Completed M4 render run directory")
+  .option("--edit-ir <file>", "Matching validated edit_ir.json (defaults to run directory)")
+  .option("--transcript <file>", "Matching transcript.json (defaults to run directory)")
+  .option("--compare <folder>", "Build blind A/B pairs against clips in this folder")
+  .option("--key-dir <folder>", "Private directory for the blind mapping key", "C:/vclip-data/blind-keys")
+  .action(async (runDirectory: string, options: { editIr?: string; transcript?: string; compare?: string; keyDir: string }) => {
+    const reviewOptions = { editIrPath: options.editIr, transcriptPath: options.transcript, keyDirectory: options.keyDir };
+    const result = options.compare
+      ? await createBlindReview(runDirectory, options.compare, reviewOptions)
+      : await createReviewSheet(runDirectory, reviewOptions);
+    console.log(`Review sheet: ${result.htmlPath}`);
+    if ("csvPath" in result) console.log(`Fallback CSV: ${result.csvPath}`);
+    if ("keyPath" in result) console.log(`Blind key stored separately: ${result.keyPath}`);
+    console.log(options.compare
+      ? "Share only the blind-review folder. Its clip files have opaque names; the A/B mapping key is stored separately. The page makes no network requests."
+      : "The review page is self-contained and makes no network requests. Copy the rendered clips with the review folder when sharing it.");
+  });
+
+program.command("eval")
+  .description("Summarize ratings and locally recorded production metrics (M5)")
+  .option("--eval-dir <folder>", "Folder containing ratings CSV files", "C:/vclip-data/eval")
+  .option("--runs-dir <folder>", "Folder containing local run artifacts", "C:/vclip-data/runs")
+  .option("--out <file>", "Markdown report path", "C:/vclip-data/eval/report.md")
+  .action(async (options: { evalDir: string; runsDir: string; out: string }) => {
+    const result = await evaluate(options.evalDir, options.runsDir, options.out);
+    console.log(`Read ${result.ratings} valid ratings; skipped ${result.malformed} malformed rows.`);
+    console.log(`Evaluation report: ${result.reportPath}`);
+  });
+
+program.command("purge")
+  .description("Delete a creator's or run's local artifacts and associated ratings (M5)")
+  .argument("<creator-or-run>", "Exact run ID or creator ID/name recorded in local metadata")
+  .option("--dry-run", "Show what would be deleted without changing files")
+  .option("--runs-dir <folder>", "Run directory", "C:/vclip-data/runs")
+  .option("--eval-dir <folder>", "Evaluation/rating directory", "C:/vclip-data/eval")
+  .action(async (target: string, options: { dryRun?: boolean; runsDir: string; evalDir: string }) => {
+    if (options.dryRun) {
+      const plan = await planPurge(target, options.runsDir, options.evalDir);
+      const ratingCount = Object.values(plan.ratingRowsByFile).reduce((a, b) => a + b, 0);
+      console.log(`Dry run: ${plan.runDirs.length} run folder(s) and ${ratingCount} rating row(s) match.`);
+      for (const dir of plan.runDirs) console.log(`Would delete run: ${dir}`);
+      for (const [file, count] of Object.entries(plan.ratingRowsByFile)) if (count) console.log(`Would remove ${count} rating row(s) from ${file}`);
+      return;
+    }
+    const rl = createInterface({ input: stdin, output: stdout });
+    try {
+      const answer = await rl.question(`Permanently delete matching runs and ratings for "${target}"? Type DELETE to continue: `);
+      const result = await purge(target, options.runsDir, options.evalDir, false, async () => answer === "DELETE");
+      console.log(`Purge complete: deleted ${result.deletedRuns} run folder(s), removed ${result.removedRatings} rating row(s). A content-free audit entry was written outside the project.`);
+    } finally { rl.close(); }
   });
 
 program.parseAsync(process.argv).catch((error: unknown) => {
