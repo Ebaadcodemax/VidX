@@ -18,3 +18,31 @@ coverage/
 .vitest/
 *.gguf
 *.bin
+
+# Creator media and generated processing artifacts. Keep these outside Git,
+# including when a user accidentally places them outside the runs/ directory.
+*.mp4
+*.mov
+*.webm
+*.m4v
+*.mkv
+*.avi
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.srt
+*.ass
+transcript.json
+transcript-*.json
+transcript_*.json
+
+# Local datasets, exports, and evaluation data. Rights-cleared fixture media
+# can be intentionally added only after review and an explicit allow rule.
+/data/
+/datasets/
+/local-data/
+/exports/
+/eval/*.csv
+/eval/*.json
+/eval/*.md
