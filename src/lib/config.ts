@@ -23,6 +23,13 @@ export async function loadConfig(filePath = resolve(process.cwd(), "config.yaml"
   if (!result.success) {
     throw new Error(`Config is invalid: ${result.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ")}`);
   }
+  const configuredCap = result.data.runtime.maxRunCostUsd;
+  const environmentCap = process.env.MAX_RUN_COST_USD;
+  if (environmentCap !== undefined && environmentCap.trim() !== "") {
+    const parsedCap = Number(environmentCap);
+    if (!Number.isFinite(parsedCap) || parsedCap <= 0) throw new Error("MAX_RUN_COST_USD must be a positive number");
+    result.data.runtime.maxRunCostUsd = Math.min(configuredCap, parsedCap);
+  }
   return result.data;
 }
 

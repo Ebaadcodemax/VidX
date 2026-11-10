@@ -50,6 +50,10 @@ export const configSchema = z.object({
     freeTierOnlyEnv: z.string().min(1).default("GEMINI_FREE_TIER_ONLY"),
     maxOutputTokens: z.number().int().positive().max(8192).default(2048),
     timeoutMs: z.number().int().positive().max(300000).default(120000),
+    thinkingLevel: z.enum(["low", "medium", "high"]).default("low"),
+    maxRetries: z.number().int().min(0).max(5).default(3),
+    retryBaseDelayMs: z.number().int().nonnegative().max(10000).default(1000),
+    retryMaxDelayMs: z.number().int().nonnegative().max(30000).default(8000),
     maxClips: z.number().int().positive().max(20).default(8),
     minClipSeconds: z.number().positive().default(15),
     maxClipSeconds: z.number().positive().max(90).default(90),
@@ -57,7 +61,8 @@ export const configSchema = z.object({
   }).strict().default({
     provider: "gemini", model: "gemini-3.8-flash", apiKeyEnv: "GEMINI_API_KEY",
     creatorConsentEnv: "GEMINI_CREATOR_CONSENT", unpaidDataUseAckEnv: "GEMINI_UNPAID_DATA_USE_ACK",
-    freeTierOnlyEnv: "GEMINI_FREE_TIER_ONLY", maxOutputTokens: 2048, timeoutMs: 120000,
+    freeTierOnlyEnv: "GEMINI_FREE_TIER_ONLY", maxOutputTokens: 2048, timeoutMs: 120000, thinkingLevel: "low",
+    maxRetries: 3, retryBaseDelayMs: 1000, retryMaxDelayMs: 8000,
     maxClips: 8, minClipSeconds: 15, maxClipSeconds: 90, endPaddingSeconds: 0.3,
   }),
 }).strict();

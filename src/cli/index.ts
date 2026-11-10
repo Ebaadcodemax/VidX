@@ -103,11 +103,22 @@ program.command("plan")
   .description("Propose, critique, validate and snap clips from a saved transcript (M3; no rendering)")
   .argument("<transcript-file>", "A vclip transcript.json file")
   .option("--out <directory>", "New output directory; defaults to config.yaml setting")
-  .action(async (transcriptFile: string, options: { out?: string }) => {
+  .option("--model <model-id>", "Temporary, explicitly priced Gemini model override for this run")
+  .action(async (transcriptFile: string, options: { out?: string; model?: string }) => {
     const config = await loadConfig();
+    const configuredModel = config.reasoner.model;
+    let modelSelectionReason: string | undefined;
+    if (options.model) {
+      if (!config.pricing.gemini?.[options.model]) throw new Error(`No reviewed price is configured for ${options.model}; refusing model override`);
+      config.reasoner.model = options.model;
+      modelSelectionReason = options.model === configuredModel
+        ? "Explicit run override matches the configured model."
+        : `Temporary run-only override from ${configuredModel} to ${options.model}; the configured default was retained after repeated 503/timeout errors. The API model catalog listed this alternative for this key.`;
+      console.log(modelSelectionReason);
+    }
     console.log("Sending transcript text to the configured reasoner; audio/video files are not uploaded in M3.");
     console.log(`Model: ${config.reasoner.provider}/${config.reasoner.model}; spend cap: $${config.runtime.maxRunCostUsd.toFixed(2)}.`);
-    const result = await runClipPlanning(transcriptFile, config, options.out);
+    const result = await runClipPlanning(transcriptFile, config, options.out, undefined, modelSelectionReason);
     console.log(`Planning complete: ${result.runDirectory}`);
     console.log(`Edit IR: ${result.editIrPath}`);
     console.log(`Rejected candidates: ${result.rejectedPath}`);

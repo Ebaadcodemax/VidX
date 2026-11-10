@@ -3,10 +3,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import type { Reasoner } from "../src/adapters/reasoner";
+import { RetryableReasonerError, type Reasoner } from "../src/adapters/reasoner";
 import { configSchema } from "../src/schemas/config";
 import { editIrSchema, proposalSchema, proposedClipSchema } from "../src/schemas/edit-ir";
-import { generateWithRepair, isWordAligned, runClipPlanning, snapClipBoundaries, validateCandidate, validateProposal } from "../src/pipeline/plan-clips";
+import { generateWithRepair, isWordAligned, runClipPlanning, snapClipBoundaries, validateCandidate, validateProposal, type ModelCallRecord } from "../src/pipeline/plan-clips";
 import type { TranscriptDocument, TranscriptWord } from "../src/schemas/transcript";
 
 const config = configSchema.parse({ pricing: { test: { mock: { inputUsdPerMillionTokens: 0.75, outputUsdPerMillionTokens: 3.75 } } } });
@@ -70,18 +70,19 @@ describe("Edit IR v0 schemas and deterministic checks", () => {
   });
 
   it("makes exactly one repair call when the first structured response is invalid", async () => {
-    const outputs: unknown[] = [{ ok: "no", unknown: true }, { ok: "yes" }];
+    const outputs: unknown[] = ["not JSON", { ok: "yes" }];
     const prompts: string[] = [];
     const mock: Reasoner = {
       id: "test", model: "mock",
       async availability() { return { available: true }; },
       async generateJson(prompt) { prompts.push(prompt); return { data: outputs.shift(), usage: { inputTokens: 3, outputTokens: 2, elapsedMs: 1 } }; },
     };
-    const calls: Array<{ provider: string; model: string; stage: string; promptVersion: string; inputTokens: number | null; outputTokens: number | null; estimatedCostUsd: number; elapsedMs: number }> = [];
+    const calls: ModelCallRecord[] = [];
     const result = await generateWithRepair(mock, "initial", z.object({ ok: z.literal("yes") }).strict(), "test-prompt-v1", rate, calls, 0.05);
     expect(result.value).toEqual({ ok: "yes" });
     expect(prompts).toHaveLength(2);
     expect(prompts[1]).toContain("REPAIR ATTEMPT");
+    expect(prompts[1]).toContain("Previous JSON (untrusted)");
     expect(calls).toHaveLength(2);
   });
 
@@ -91,6 +92,32 @@ describe("Edit IR v0 schemas and deterministic checks", () => {
     const result = await generateWithRepair(mock, "prompt", z.object({ required: z.string() }).strict(), "test-prompt-v1", rate, [], 0.05);
     expect(count).toBe(2);
     expect(result.value).toBeUndefined();
+  });
+
+  it("retries transient 503 and 429 responses with a bounded attempt count", async () => {
+    let count = 0;
+    const mock: Reasoner = { id: "test", model: "mock", async availability() { return { available: true }; }, async generateJson() {
+      count += 1;
+      if (count < 3) throw new RetryableReasonerError("temporary overload", count === 1 ? 503 : 429, 0);
+      return { data: { ok: "yes" }, usage: { inputTokens: 2, outputTokens: 2, elapsedMs: 1 } };
+    } };
+    const calls: ModelCallRecord[] = [];
+    const result = await generateWithRepair(mock, "prompt", z.object({ ok: z.literal("yes") }).strict(), "test-prompt-v1", rate, calls, 0.05, undefined, { maxRetries: 2, retryBaseDelayMs: 0, retryMaxDelayMs: 0, maxOutputTokens: 10 });
+    expect(result.value).toEqual({ ok: "yes" });
+    expect(count).toBe(3);
+    expect(calls.map((call) => call.retryStatus)).toEqual([503, 429, undefined]);
+    expect(calls[0]!.estimatedCostUsd).toBe(0);
+    expect(calls[0]!.reservedCostUsd).toBeGreaterThan(0);
+  });
+
+  it("reserves retry cost before another provider attempt and stops at the run cap", async () => {
+    let count = 0;
+    const mock: Reasoner = { id: "test", model: "mock", async availability() { return { available: true }; }, async generateJson() { count += 1; throw new RetryableReasonerError("busy", 429, 0); } };
+    const calls: ModelCallRecord[] = [];
+    await expect(generateWithRepair(mock, "prompt", z.object({ ok: z.string() }).strict(), "test-prompt-v1", rate, calls, 0.01, undefined, { maxRetries: 3, retryBaseDelayMs: 0, retryMaxDelayMs: 0, maxOutputTokens: 2048 })).rejects.toThrow("exceeds configured cap");
+    expect(count).toBe(1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.estimatedCostUsd).toBeLessThanOrEqual(0.01);
   });
 
   it("runs the planner end to end with mocked proposal and critic responses", async () => {
@@ -115,6 +142,8 @@ describe("Edit IR v0 schemas and deterministic checks", () => {
       expect(written.clips[0]!.start_s).toBe(0);
       expect(written.clips[0]!.end_s).toBe(27.3);
       expect(written.clips[0]!.critic.verdict).toBe("keep");
+      expect(JSON.parse(await readFile(join(result.runDirectory, "proposal.json"), "utf8")).proposal.clips).toHaveLength(1);
+      expect(JSON.parse(await readFile(join(result.runDirectory, "critic.json"), "utf8")).verdicts[0].verdict).toBe("keep");
       expect(mockResponses).toHaveLength(0);
     } finally { await rm(directory, { recursive: true, force: true }); }
   });

@@ -2,7 +2,7 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import { z, type ZodType } from "zod";
 import { GeminiReasoner } from "../adapters/gemini-reasoner";
-import type { ModelUsage, Reasoner } from "../adapters/reasoner";
+import { RetryableReasonerError, type ModelUsage, type Reasoner } from "../adapters/reasoner";
 import { assertWithinRunBudget, estimateUsageCost } from "../lib/cost";
 import type { AppConfig } from "../schemas/config";
 import { criticResponseSchema, editIrSchema, proposalSchema, proposedClipSchema, type CriticVerdict, type EditIr, type ProposedClip, type Proposal } from "../schemas/edit-ir";
@@ -12,9 +12,11 @@ const PROMPT_DIR = resolve(__dirname, "../prompts");
 const TERMINAL = /[.!?।][”’"')\]]*$/u;
 
 export interface PlanResult { runDirectory: string; editIrPath: string; rejectedPath: string; costPath: string; clips: EditIr["clips"]; }
-export interface ModelCallRecord { provider: string; model: string; stage: string; promptVersion: string; inputTokens: number | null; outputTokens: number | null; estimatedCostUsd: number; elapsedMs: number; }
+export interface RejectedCandidate { clip_id: string; stage: string; reason: string; candidate?: ProposedClip; critic?: CriticVerdict; }
+export interface ModelCallRecord { provider: string; model: string; endpoint: string; stage: string; promptVersion: string; repairAttempt: number; attempt: number; outcome: "succeeded" | "invalid_output" | "retryable_error" | "failed"; retryStatus?: number; responseStatus?: string; thoughtTokens?: number | null; inputTokens: number | null; outputTokens: number | null; reservedCostUsd: number; estimatedCostUsd: number; elapsedMs: number; }
+export interface RetryPolicy { maxRetries: number; retryBaseDelayMs: number; retryMaxDelayMs: number; maxOutputTokens: number; }
 
-export async function runClipPlanning(transcriptFile: string, config: AppConfig, outputDirectory?: string, reasoner?: Reasoner): Promise<PlanResult> {
+export async function runClipPlanning(transcriptFile: string, config: AppConfig, outputDirectory?: string, reasoner?: Reasoner, modelSelectionReason?: string): Promise<PlanResult> {
   const transcriptPath = resolve(transcriptFile);
   await access(transcriptPath);
   const transcript = transcriptSchema.parse(JSON.parse(await readFile(transcriptPath, "utf8")));
@@ -29,7 +31,7 @@ export async function runClipPlanning(transcriptFile: string, config: AppConfig,
   const rate = config.pricing[model.id]?.[model.model];
   if (!rate) throw new Error(`No reviewed price configured for ${model.id}/${model.model}; refusing to call provider`);
   const calls: ModelCallRecord[] = [];
-  const rejected: Array<{ clip_id: string; stage: string; reason: string }> = [];
+  const rejected: RejectedCandidate[] = [];
   const promptProposal = await readFile(join(PROMPT_DIR, "clip-proposal-v1.md"), "utf8");
   const proposalPrompt = fill(promptProposal, {
     max_clips: String(config.reasoner.maxClips), min_seconds: String(config.reasoner.minClipSeconds), max_seconds: String(config.reasoner.maxClipSeconds),
@@ -37,13 +39,23 @@ export async function runClipPlanning(transcriptFile: string, config: AppConfig,
     transcript: formatWords(transcript.words),
   });
   let proposalResult: Awaited<ReturnType<typeof generateWithRepair<Proposal>>>;
-  try { proposalResult = await generateWithRepair(model, proposalPrompt, proposalSchema, "clip-proposal-v1", rate, calls, config.runtime.maxRunCostUsd, (candidate) => validateProposal(candidate, transcript, config)); }
-  catch (error) { await writeFailure(output, transcript, model, calls, "clip-proposal-v1", error); throw error; }
+  const retryPolicy = {
+    maxRetries: config.reasoner.maxRetries,
+    retryBaseDelayMs: config.reasoner.retryBaseDelayMs,
+    retryMaxDelayMs: config.reasoner.retryMaxDelayMs,
+    maxOutputTokens: config.reasoner.maxOutputTokens,
+  };
+  try { proposalResult = await generateWithRepair(model, proposalPrompt, proposalSchema, "clip-proposal-v1", rate, calls, config.runtime.maxRunCostUsd, (candidate) => validateProposal(candidate, transcript, config), retryPolicy); }
+  catch (error) { await writeFailure(output, transcript, model, calls, "clip-proposal-v1", error, modelSelectionReason, undefined, config.runtime.maxRunCostUsd); throw error; }
   let proposal = proposalResult.value;
   if (!proposal) {
     const raw = proposalResult.raw;
     const shell = proposalShellSchema.safeParse(raw);
-    if (!shell.success) throw new Error("Gemini proposal remained invalid after one repair; no valid candidate list to review");
+    if (!shell.success) {
+      const error = new Error("Gemini proposal remained invalid after one repair; no valid candidate list to review");
+      await writeFailure(output, transcript, model, calls, "clip-proposal-v1", error, modelSelectionReason, raw, config.runtime.maxRunCostUsd);
+      throw error;
+    }
     proposal = { ...shell.data, clips: [] };
     for (const [index, candidate] of shell.data.clips.entries()) {
       const parsed = proposedClipSchema.safeParse(candidate);
@@ -58,40 +70,40 @@ export async function runClipPlanning(transcriptFile: string, config: AppConfig,
   const snapped: ProposedClip[] = [];
   for (const candidate of proposal.clips) {
     const validationError = validateCandidate(candidate, transcript, config);
-    if (validationError) { rejected.push({ clip_id: candidate.id, stage: "proposal", reason: validationError }); continue; }
+    if (validationError) { rejected.push({ clip_id: candidate.id, stage: "proposal", reason: validationError, candidate }); continue; }
     try {
       const result = snapClipBoundaries(candidate, transcript.words, transcript.source.durationSeconds, config.reasoner.endPaddingSeconds);
       const postSnapError = validateCandidate(result, transcript, config, true);
-      if (postSnapError) { rejected.push({ clip_id: candidate.id, stage: "snapping", reason: postSnapError }); continue; }
+      if (postSnapError) { rejected.push({ clip_id: candidate.id, stage: "snapping", reason: postSnapError, candidate }); continue; }
       snapped.push(result);
-    } catch (error) { rejected.push({ clip_id: candidate.id, stage: "snapping", reason: error instanceof Error ? error.message : "No usable word boundary" }); }
+    } catch (error) { rejected.push({ clip_id: candidate.id, stage: "snapping", reason: error instanceof Error ? error.message : "No usable word boundary", candidate }); }
   }
   const nonOverlapping = discardOverlaps(snapped, rejected);
 
   const promptCritic = await readFile(join(PROMPT_DIR, "critic-v1.md"), "utf8");
   const criticPrompt = fill(promptCritic, { candidates: JSON.stringify(nonOverlapping.map((clip) => ({ ...clip, transcript_excerpt: excerpt(transcript.words, clip.start_s, clip.end_s) })), null, 2) });
   let criticResult: Awaited<ReturnType<typeof generateWithRepair<z.infer<typeof criticResponseSchema>>>>;
-  try { criticResult = await generateWithRepair(model, criticPrompt, criticResponseSchema, "critic-v1", rate, calls, config.runtime.maxRunCostUsd, (result) => validateCriticSet(result, nonOverlapping.map((clip) => clip.id))); }
-  catch (error) { await writeFailure(output, transcript, model, calls, "critic-v1", error); throw error; }
+  try { criticResult = await generateWithRepair(model, criticPrompt, criticResponseSchema, "critic-v1", rate, calls, config.runtime.maxRunCostUsd, (result) => validateCriticSet(result, nonOverlapping.map((clip) => clip.id)), retryPolicy); }
+  catch (error) { await writeFailure(output, transcript, model, calls, "critic-v1", error, modelSelectionReason, undefined, config.runtime.maxRunCostUsd); throw error; }
   const verdicts = criticResult.value?.verdicts ?? [];
   const verdictById = new Map(verdicts.map((verdict) => [verdict.clip_id, verdict]));
   const accepted: EditIr["clips"] = [];
   for (const clip of nonOverlapping) {
     const verdict = verdictById.get(clip.id);
-    if (!verdict) { rejected.push({ clip_id: clip.id, stage: "critic", reason: "No valid critic verdict after one repair attempt" }); continue; }
+    if (!verdict) { rejected.push({ clip_id: clip.id, stage: "critic", reason: "No valid critic verdict after one repair attempt", candidate: clip }); continue; }
     const error = validateCriticVerdict(verdict, clip, transcript, nonOverlapping.map((item) => item.id));
-    if (error) { rejected.push({ clip_id: clip.id, stage: "critic", reason: error }); continue; }
+    if (error) { rejected.push({ clip_id: clip.id, stage: "critic", reason: error, candidate: clip, critic: verdict }); continue; }
     if (verdict.verdict === "reject" || !verdict.standalone || !verdict.payoff) {
-      rejected.push({ clip_id: clip.id, stage: "critic", reason: verdict.reason }); continue;
+      rejected.push({ clip_id: clip.id, stage: "critic", reason: verdict.reason, candidate: clip, critic: verdict }); continue;
     }
     let finalClip = clip;
     if (verdict.verdict === "fix_boundaries") {
       const adjusted = { ...clip, start_s: verdict.suggested_start_s!, end_s: verdict.suggested_end_s! };
       const boundaryError = validateCandidate(adjusted, transcript, config);
-      if (boundaryError) { rejected.push({ clip_id: clip.id, stage: "critic-fix", reason: boundaryError }); continue; }
+      if (boundaryError) { rejected.push({ clip_id: clip.id, stage: "critic-fix", reason: boundaryError, candidate: clip, critic: verdict }); continue; }
       finalClip = snapClipBoundaries(adjusted, transcript.words, transcript.source.durationSeconds, config.reasoner.endPaddingSeconds);
       const snappedError = validateCandidate(finalClip, transcript, config, true);
-      if (snappedError) { rejected.push({ clip_id: clip.id, stage: "critic-fix", reason: snappedError }); continue; }
+      if (snappedError) { rejected.push({ clip_id: clip.id, stage: "critic-fix", reason: snappedError, candidate: finalClip, critic: verdict }); continue; }
     }
     accepted.push({ ...finalClip, critic: {
       verdict: verdict.verdict,
@@ -113,6 +125,8 @@ export async function runClipPlanning(transcriptFile: string, config: AppConfig,
   const rejectedPath = join(output, "rejected-candidates.json");
   const editIrPath = join(output, "edit_ir.json");
   const costPath = join(output, "cost.json");
+  await writeNew(join(output, "proposal.json"), { promptVersion: "clip-proposal-v1", proposal });
+  await writeNew(join(output, "critic.json"), { promptVersion: "critic-v1", verdicts });
   await writeNew(editIrPath, finalIr);
   await writeNew(rejectedPath, { schemaVersion: "vclip-rejected-candidates/0.1", promptVersions: ["clip-proposal-v1", "critic-v1"], rejected });
   await writeNew(costPath, {
@@ -122,9 +136,9 @@ export async function runClipPlanning(transcriptFile: string, config: AppConfig,
   });
   await writeNew(join(output, "planning.json"), {
     schemaVersion: "vclip-planning-run/0.1", startedAt: calls.length ? new Date(Date.now() - calls.reduce((sum, call) => sum + call.elapsedMs, 0)).toISOString() : new Date().toISOString(),
-    completedAt: new Date().toISOString(), source: transcript.source, model: { provider: model.id, model: model.model },
+    completedAt: new Date().toISOString(), source: transcript.source, model: { provider: model.id, model: model.model, endpoint: model.endpoint ?? "custom-provider" },
     promptVersions: ["clip-proposal-v1", "critic-v1"], candidateCount: proposal.clips.length, acceptedCount: accepted.length,
-    rejectedCount: rejected.length, note: "No media rendering occurs in M3.",
+    rejectedCount: rejected.length, modelSelectionReason: modelSelectionReason ?? "Configured model used.", note: "No media rendering occurs in M3.",
   });
   return { runDirectory: output, editIrPath, rejectedPath, costPath, clips: finalIr.clips };
 }
@@ -183,25 +197,51 @@ function sentenceRanges(words: TranscriptWord[]): Array<{ start: number; end: nu
   return ranges;
 }
 
-export async function generateWithRepair<T>(reasoner: Reasoner, prompt: string, schema: ZodType<T>, version: string, rate: NonNullable<AppConfig["pricing"][string]>[string], calls: ModelCallRecord[], cap: number, semanticCheck?: (value: T) => string | undefined): Promise<{ value?: T; raw: unknown }> {
+export async function generateWithRepair<T>(reasoner: Reasoner, prompt: string, schema: ZodType<T>, version: string, rate: NonNullable<AppConfig["pricing"][string]>[string], calls: ModelCallRecord[], cap: number, semanticCheck?: (value: T) => string | undefined, retryPolicy: RetryPolicy = { maxRetries: 3, retryBaseDelayMs: 1000, retryMaxDelayMs: 8000, maxOutputTokens: 2048 }): Promise<{ value?: T; raw: unknown }> {
   let raw: unknown;
   let lastIssues = "model response did not match the required schema";
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const request = attempt === 0 ? prompt : `${prompt}\n\nREPAIR ATTEMPT: Your previous JSON failed validation. Correct it using this deterministic validator feedback:\n${lastIssues}\nPrevious JSON (untrusted):\n${JSON.stringify(raw)}\nReturn the complete corrected JSON only.`;
-    const reserve = estimateUsageCost(rate, { inputTokens: Math.ceil(request.length / 4), outputTokens: 2048 });
-    const alreadySpent = calls.reduce((sum, call) => sum + call.estimatedCostUsd, 0);
-    assertWithinRunBudget(alreadySpent + reserve, cap);
-    let result: { data: unknown; usage: ModelUsage };
-    try { result = await reasoner.generateJson(request, schema); }
-    catch (error) {
-      calls.push({ provider: reasoner.id, model: reasoner.model, stage: version, promptVersion: version, inputTokens: Math.ceil(request.length / 4), outputTokens: null, estimatedCostUsd: reserve, elapsedMs: 0 });
-      throw error;
+  for (let repairAttempt = 0; repairAttempt < 2; repairAttempt += 1) {
+    const request = repairAttempt === 0 ? prompt : `${prompt}\n\nREPAIR ATTEMPT: Your previous JSON failed validation. Correct it using this deterministic validator feedback:\n${lastIssues}\nPrevious JSON (untrusted):\n${JSON.stringify(raw)}\nReturn the complete corrected JSON only.`;
+    let result: { data: unknown; usage: ModelUsage } | undefined;
+    for (let attempt = 0; attempt <= retryPolicy.maxRetries; attempt += 1) {
+      const inputTokenReservation = reasoner.countInputTokens
+        ? await reasoner.countInputTokens(request)
+        : Math.ceil(request.length / 2);
+      const reserve = estimateUsageCost(rate, { inputTokens: inputTokenReservation, outputTokens: retryPolicy.maxOutputTokens });
+      const alreadyReserved = calls.reduce((sum, call) => sum + call.estimatedCostUsd, 0);
+      assertWithinRunBudget(alreadyReserved + reserve, cap);
+      const attemptStarted = Date.now();
+      try {
+        result = await reasoner.generateJson(request, schema);
+      } catch (error) {
+        const retryable = error instanceof RetryableReasonerError;
+        calls.push({
+          provider: reasoner.id, model: reasoner.model, endpoint: reasoner.endpoint ?? "custom-provider", stage: version, promptVersion: version, repairAttempt,
+          attempt: attempt + 1, outcome: retryable && attempt < retryPolicy.maxRetries ? "retryable_error" : "failed",
+          ...(retryable ? { retryStatus: error.statusCode } : {}),
+          inputTokens: inputTokenReservation, outputTokens: null, reservedCostUsd: reserve,
+          // Google's billing documentation says failed 5xx requests aren't billed.
+          // Keep the reservation in the audit trail but release it for HTTP 503.
+          estimatedCostUsd: retryable && error.statusCode === 503 ? 0 : reserve,
+          elapsedMs: Date.now() - attemptStarted,
+        });
+        if (!retryable || attempt >= retryPolicy.maxRetries) throw error;
+        const exponentialDelay = Math.min(retryPolicy.retryBaseDelayMs * (2 ** attempt), retryPolicy.retryMaxDelayMs);
+        const delay = Math.min(error.retryAfterMs ?? exponentialDelay, retryPolicy.retryMaxDelayMs);
+        if (delay > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, delay));
+        continue;
+      }
+      const usedInputTokens = result.usage.inputTokens ?? inputTokenReservation;
+      const cost = estimateUsageCost(rate, { inputTokens: usedInputTokens, outputTokens: result.usage.outputTokens ?? retryPolicy.maxOutputTokens });
+      calls.push({ provider: reasoner.id, model: reasoner.model, endpoint: reasoner.endpoint ?? "custom-provider", stage: version, promptVersion: version, repairAttempt, attempt: attempt + 1, outcome: "succeeded", ...(result.usage.responseStatus ? { responseStatus: result.usage.responseStatus } : {}), thoughtTokens: result.usage.thoughtTokens, inputTokens: usedInputTokens, outputTokens: result.usage.outputTokens, reservedCostUsd: reserve, estimatedCostUsd: cost, elapsedMs: result.usage.elapsedMs });
+      assertWithinRunBudget(calls.reduce((sum, call) => sum + call.estimatedCostUsd, 0), cap);
+      break;
     }
+    if (!result) throw new Error("Gemini retry loop ended without a response");
     raw = result.data;
     const parsed = schema.safeParse(raw);
-    const cost = estimateUsageCost(rate, { inputTokens: result.usage.inputTokens ?? Math.ceil(request.length / 4), outputTokens: result.usage.outputTokens ?? 2048 });
-    calls.push({ provider: reasoner.id, model: reasoner.model, stage: version, promptVersion: version, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, estimatedCostUsd: cost, elapsedMs: result.usage.elapsedMs });
-    assertWithinRunBudget(calls.reduce((sum, call) => sum + call.estimatedCostUsd, 0), cap);
+    const completedCall = calls[calls.length - 1];
+    if (completedCall) completedCall.outcome = parsed.success ? "succeeded" : "invalid_output";
     if (parsed.success) {
       const semanticError = semanticCheck?.(parsed.data);
       if (!semanticError) return { value: parsed.data, raw };
@@ -249,12 +289,12 @@ function validateCriticVerdict(verdict: CriticVerdict, clip: ProposedClip, trans
   return undefined;
 }
 
-function discardOverlaps(clips: ProposedClip[], rejected: Array<{ clip_id: string; stage: string; reason: string }>): ProposedClip[] {
+function discardOverlaps(clips: ProposedClip[], rejected: RejectedCandidate[]): ProposedClip[] {
   const sorted = [...clips].sort((a, b) => a.start_s - b.start_s || b.scores.standalone - a.scores.standalone || b.scores.hook - a.scores.hook);
   const accepted: ProposedClip[] = [];
   for (const clip of sorted) {
     const overlap = accepted.find((other) => clip.start_s < other.end_s && clip.end_s > other.start_s);
-    if (overlap) rejected.push({ clip_id: clip.id, stage: "validation", reason: `overlaps accepted clip ${overlap.id}` });
+    if (overlap) rejected.push({ clip_id: clip.id, stage: "validation", reason: `overlaps accepted clip ${overlap.id}`, candidate: clip });
     else accepted.push(clip);
   }
   return accepted;
@@ -274,7 +314,9 @@ function safeStem(fileName: string): string { return basename(fileName).replace(
 function isWithin(parent: string, child: string): boolean { const rel = relative(resolve(parent), resolve(child)); return rel === "" || (rel !== ".." && !rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && !rel.startsWith("/")); }
 function zodMessage(error: z.ZodError): string { return error.issues.map((issue) => `${issue.path.join(".") || "response"}: ${issue.message}`).join("; "); }
 async function writeNew(path: string, value: unknown): Promise<void> { await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx", encoding: "utf8" }); }
-async function writeFailure(output: string, transcript: TranscriptDocument, model: Reasoner, calls: ModelCallRecord[], stage: string, error: unknown): Promise<void> {
+async function writeFailure(output: string, transcript: TranscriptDocument, model: Reasoner, calls: ModelCallRecord[], stage: string, error: unknown, modelSelectionReason?: string, modelOutput?: unknown, configuredCapUsd = 0.05): Promise<void> {
   const total = calls.reduce((sum, call) => sum + call.estimatedCostUsd, 0);
-  await writeNew(join(output, "failure.json"), { schemaVersion: "vclip-planning-failure/0.1", failedAt: new Date().toISOString(), stage, source: transcript.source, model: { provider: model.id, model: model.model }, calls, estimatedTotalUsd: total, safeMessage: error instanceof Error ? error.message : "Planning failed" }).catch(() => undefined);
+  const costRecord = { currency: "USD", estimatedTotalUsd: total, providerCalls: calls, configuredRunCapUsd: configuredCapUsd, costBasis: "Actual provider token usage when returned; conservative reservation otherwise. Google documents failed 5xx requests as unbilled; those attempts retain their held reservation separately." };
+  await writeNew(join(output, "cost.json"), costRecord).catch(() => undefined);
+  await writeNew(join(output, "failure.json"), { schemaVersion: "vclip-planning-failure/0.1", failedAt: new Date().toISOString(), stage, source: transcript.source, model: { provider: model.id, model: model.model, endpoint: model.endpoint ?? "custom-provider" }, modelSelectionReason: modelSelectionReason ?? "Configured model used.", calls, estimatedTotalUsd: total, safeMessage: error instanceof Error ? error.message : "Planning failed", ...(modelOutput === undefined ? {} : { invalidModelOutput: modelOutput }) }).catch(() => undefined);
 }

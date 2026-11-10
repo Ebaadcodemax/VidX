@@ -12,6 +12,9 @@ pricing:
     gemini-3.8-flash:
       inputUsdPerMillionTokens: 0.75
       outputUsdPerMillionTokens: 3.75
+    gemini-3.6-flash:
+      inputUsdPerMillionTokens: 0.75
+      outputUsdPerMillionTokens: 3.75
 
 # Enable a model integration only after approval, credentials, and terms review.
 requiredEnv: []
@@ -44,6 +47,10 @@ reasoner:
   freeTierOnlyEnv: GEMINI_FREE_TIER_ONLY
   maxOutputTokens: 2048
   timeoutMs: 120000
+  thinkingLevel: low
+  maxRetries: 3
+  retryBaseDelayMs: 1000
+  retryMaxDelayMs: 8000
   maxClips: 8
   minClipSeconds: 15
   maxClipSeconds: 90
