@@ -44,7 +44,7 @@ describe("M5 evaluation helpers", () => {
       await writeFile(join(run, "render.json"), JSON.stringify({ source: { creatorId: "creator7" } }));
       await writeFile(join(evalDir, "ratings.csv"), "run_id,clip_id,rater,rating,notes,would_post,edited_before_posting\r\ncreator7-run-a,c1,r,no,,no,false\r\n");
       const result = await purge("creator7", runs, evalDir, true, async () => { throw new Error("dry run must not ask for confirmation"); });
-      expect(result).toEqual({ deletedRuns: 1, removedRatings: 1 });
+      expect(result).toEqual({ deletedRuns: 1, deletedKeys: 0, removedRatings: 1 });
       await expect(readFile(join(run, "render.json"), "utf8")).resolves.toContain("creatorId");
       await expect(readFile(join(evalDir, "ratings.csv"), "utf8")).resolves.toContain("creator7-run-a");
     } finally { await rm(root, { recursive: true, force: true }); }

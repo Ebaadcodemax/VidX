@@ -186,20 +186,22 @@ program.command("purge")
   .option("--dry-run", "Show what would be deleted without changing files")
   .option("--runs-dir <folder>", "Run directory", "C:/vclip-data/runs")
   .option("--eval-dir <folder>", "Evaluation/rating directory", "C:/vclip-data/eval")
-  .action(async (target: string, options: { dryRun?: boolean; runsDir: string; evalDir: string }) => {
+  .option("--key-dir <folder>", "Blind comparison key directory", "C:/vclip-data/blind-keys")
+  .action(async (target: string, options: { dryRun?: boolean; runsDir: string; evalDir: string; keyDir: string }) => {
     if (options.dryRun) {
-      const plan = await planPurge(target, options.runsDir, options.evalDir);
+      const plan = await planPurge(target, options.runsDir, options.evalDir, options.keyDir);
       const ratingCount = Object.values(plan.ratingRowsByFile).reduce((a, b) => a + b, 0);
-      console.log(`Dry run: ${plan.runDirs.length} run folder(s) and ${ratingCount} rating row(s) match.`);
+      console.log(`Dry run: ${plan.runDirs.length} run folder(s), ${plan.keyDirs.length} key folder(s), and ${ratingCount} rating row(s) match.`);
       for (const dir of plan.runDirs) console.log(`Would delete run: ${dir}`);
+      for (const dir of plan.keyDirs) console.log(`Would delete private comparison key: ${dir}`);
       for (const [file, count] of Object.entries(plan.ratingRowsByFile)) if (count) console.log(`Would remove ${count} rating row(s) from ${file}`);
       return;
     }
     const rl = createInterface({ input: stdin, output: stdout });
     try {
       const answer = await rl.question(`Permanently delete matching runs and ratings for "${target}"? Type DELETE to continue: `);
-      const result = await purge(target, options.runsDir, options.evalDir, false, async () => answer === "DELETE");
-      console.log(`Purge complete: deleted ${result.deletedRuns} run folder(s), removed ${result.removedRatings} rating row(s). A content-free audit entry was written outside the project.`);
+      const result = await purge(target, options.runsDir, options.evalDir, false, async () => answer === "DELETE", options.keyDir);
+      console.log(`Purge complete: deleted ${result.deletedRuns} run folder(s) and ${result.deletedKeys} private key folder(s), removed ${result.removedRatings} rating row(s). A content-free audit entry was written outside the project.`);
     } finally { rl.close(); }
   });
 

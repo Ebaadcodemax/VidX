@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { access, copyFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { editIrSchema, type EditIr } from "../schemas/edit-ir";
 import { transcriptSchema } from "../schemas/transcript";
@@ -73,10 +73,17 @@ export function randomizePairs<A, B>(pairs: Array<[A, B]>, random: () => number 
 
 export async function createReviewSheet(runDirectory: string, options: ReviewOptions = {}): Promise<{ htmlPath: string; csvPath: string; keyPath?: string }> {
   const dir = resolve(runDirectory), runId = basename(dir);
-  const render = JSON.parse(await readFile(join(dir, "render.json"), "utf8")) as { clips?: Array<{ id: string; videoPath: string }>; source?: { sha256?: string } };
-  const editPath = resolve(options.editIrPath ?? join(dir, "edit_ir.json"));
-  const transcriptPath = resolve(options.transcriptPath ?? join(dir, "transcript.json"));
+  const render = JSON.parse(await readFile(join(dir, "render.json"), "utf8")) as { clips?: Array<{ id: string; videoPath: string; durationSeconds: number }>; source?: { sha256?: string } };
+  const sourceHash = render.source?.sha256;
+  if (!sourceHash) throw new Error("render.json is missing its source hash");
+  const editPath = options.editIrPath ? resolve(options.editIrPath) : await findMatchingSidecar(dir, "edit_ir.json", sourceHash, (value) => {
+    const renderClips = new Map((render.clips ?? []).map((clip) => [clip.id, clip.durationSeconds]));
+    const matched = (value.clips ?? []).filter((clip: { id: string }) => renderClips.has(clip.id));
+    const delta = matched.reduce((sum: number, clip: { id: string; start_s: number; end_s: number }) => sum + Math.abs((clip.end_s - clip.start_s) - (renderClips.get(clip.id) ?? 0)), 0);
+    return matched.length * 1000 - delta;
+  });
   const ir: EditIr = editIrSchema.parse(JSON.parse(await readFile(editPath, "utf8")));
+  const transcriptPath = options.transcriptPath ? resolve(options.transcriptPath) : await findMatchingSidecar(dir, "transcript.json", sourceHash, (value) => scriptMatchScore(value.words ?? [], ir.language));
   const transcript = transcriptSchema.parse(JSON.parse(await readFile(transcriptPath, "utf8")));
   if (render.source?.sha256 !== ir.source.sha256 || render.source?.sha256 !== transcript.source.sha256) throw new Error("Render, Edit IR, and transcript source hashes must match");
   const renderClips = new Map((render.clips ?? []).map((clip) => [clip.id, clip]));
@@ -96,6 +103,32 @@ export async function createReviewSheet(runDirectory: string, options: ReviewOpt
   return { htmlPath, csvPath };
 }
 
+async function findMatchingSidecar(runDirectory: string, fileName: string, sourceHash: string, score: (value: any) => number): Promise<string> {
+  const direct = join(runDirectory, fileName);
+  try { await access(direct); return direct; } catch { /* Stage artifacts may be in separate M2/M3 run folders. */ }
+  const candidates: Array<{ path: string; score: number }> = [];
+  for (const path of await walk(dirname(runDirectory), (candidate) => basename(candidate) === fileName)) {
+    try {
+      const value = JSON.parse(await readFile(path, "utf8"));
+      if (value.source?.sha256 === sourceHash) candidates.push({ path, score: score(value) });
+    } catch { /* Malformed sidecars are not candidates. */ }
+  }
+  candidates.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+  if (!candidates.length) throw new Error(`Could not find matching ${fileName} for this source. Pass --${fileName === "edit_ir.json" ? "edit-ir" : "transcript"} explicitly.`);
+  return candidates[0]!.path;
+}
+
+function scriptMatchScore(words: Array<{ text: string }>, language: string): number {
+  const text = words.map((word) => word.text).join(" ");
+  const letters = text.match(/[\p{L}]/gu) ?? [];
+  if (!letters.length) return 0;
+  const latin = text.match(/[A-Za-z]/g)?.length ?? 0;
+  const devanagari = text.match(/[\u0900-\u097F]/g)?.length ?? 0;
+  if (/^en\b/i.test(language)) return latin / letters.length;
+  if (/^(hi|hin)\b/i.test(language)) return devanagari / letters.length;
+  return Math.max(latin, devanagari) / letters.length;
+}
+
 export async function createBlindReview(runDirectory: string, competitorDirectory: string, options: ReviewOptions = {}): Promise<{ htmlPath: string; keyPath: string }> {
   await createReviewSheet(runDirectory, options);
   const dir = resolve(runDirectory), runId = basename(dir), competitors = await listVideos(resolve(competitorDirectory));
@@ -113,7 +146,7 @@ export async function createBlindReview(runDirectory: string, competitorDirector
     { kind: "competitor"; path: string },
   ]), random);
   const keyRows: Array<Record<string, string>> = [], publicPairs: Array<{ pairId: string; a: string; b: string }> = [];
-  const blindDir = join(dir, "blind-review"), compareDir = join(blindDir, "assets"); await mkdir(compareDir, { recursive: true });
+  const blindDir = join(dir, "blind-review", comparisonId), compareDir = join(blindDir, "assets"); await mkdir(compareDir, { recursive: true });
   for (let i = 0; i < assignments.length; i++) {
     const assignment = assignments[i]!, pairId = `pair_${i + 1}`;
     const aIsOwn = assignment.a.kind === "ours";
@@ -131,7 +164,7 @@ export async function createBlindReview(runDirectory: string, competitorDirector
     keyRows.push({ pair_id: pairId, own_clip_id: ownClip.clip.id, own_label: ownA ? "A" : "B", competitor_file: basename(competitor.path) });
   }
   const htmlPath = join(blindDir, "review.html"), keyDir = resolve(options.keyDirectory ?? "C:/vclip-data/blind-keys");
-  const keyPath = join(keyDir, runId, "key.json"); await mkdir(dirname(keyPath), { recursive: true });
+  const keyPath = join(keyDir, runId, comparisonId, "key.json"); await mkdir(dirname(keyPath), { recursive: true });
   await writeFile(keyPath, JSON.stringify({ runId, comparisonId, mapping: keyRows }, null, 2) + "\n", "utf8");
   const abHtmlPath = htmlPath;
   await writeFile(htmlPath, blindHtml(comparisonId, publicPairs), "utf8");
@@ -160,7 +193,7 @@ export async function evaluate(evalDirectory: string, runsDirectory: string, rep
   return { reportPath: resolve(reportPath), ratings: ratings.length, malformed };
 }
 
-export async function planPurge(target: string, runsDirectory: string, evalDirectory: string): Promise<{ runDirs: string[]; ratingRowsByFile: Record<string, number> }> {
+export async function planPurge(target: string, runsDirectory: string, evalDirectory: string, keyDirectory = "C:/vclip-data/blind-keys"): Promise<{ runDirs: string[]; keyDirs: string[]; ratingRowsByFile: Record<string, number> }> {
   const root = resolve(runsDirectory);
   const runs = (await readdir(root, { withFileTypes: true }).catch(() => [])).filter((entry) => entry.isDirectory()).map((entry) => join(root, entry.name));
   const needle = target.toLowerCase(), resolvedTarget = resolve(target).toLowerCase(), matched: string[] = [];
@@ -177,13 +210,16 @@ export async function planPurge(target: string, runsDirectory: string, evalDirec
     const hi = rows[0]!.map((s) => s.trim()).indexOf("run_id"); if (hi < 0) continue;
     rowsByFile[file] = rows.slice(1).filter((row) => runIds.has((row[hi] ?? "").toLowerCase())).length;
   }
-  return { runDirs: matched, ratingRowsByFile: rowsByFile };
+  const keyDirs: string[] = [];
+  for (const dir of matched) { const keyDir = join(resolve(keyDirectory), basename(dir)); try { if ((await stat(keyDir)).isDirectory()) keyDirs.push(keyDir); } catch { /* No comparison key for this run. */ } }
+  return { runDirs: matched, keyDirs, ratingRowsByFile: rowsByFile };
 }
 
-export async function purge(target: string, runsDirectory: string, evalDirectory: string, dryRun: boolean, confirm: () => Promise<boolean>): Promise<{ deletedRuns: number; removedRatings: number }> {
-  const plan = await planPurge(target, runsDirectory, evalDirectory); if (dryRun) return { deletedRuns: plan.runDirs.length, removedRatings: Object.values(plan.ratingRowsByFile).reduce((a, b) => a + b, 0) };
+export async function purge(target: string, runsDirectory: string, evalDirectory: string, dryRun: boolean, confirm: () => Promise<boolean>, keyDirectory = "C:/vclip-data/blind-keys"): Promise<{ deletedRuns: number; deletedKeys: number; removedRatings: number }> {
+  const plan = await planPurge(target, runsDirectory, evalDirectory, keyDirectory); if (dryRun) return { deletedRuns: plan.runDirs.length, deletedKeys: plan.keyDirs.length, removedRatings: Object.values(plan.ratingRowsByFile).reduce((a, b) => a + b, 0) };
   if (!(await confirm())) throw new Error("Purge cancelled; no data was deleted");
   const ids = new Set(plan.runDirs.map((dir) => basename(dir).toLowerCase()));
+  for (const keyDir of plan.keyDirs) await rm(keyDir, { recursive: true, force: true });
   for (const dir of plan.runDirs) await rm(dir, { recursive: true, force: true });
   let removedRatings = 0;
   for (const file of Object.keys(plan.ratingRowsByFile)) {
@@ -195,7 +231,7 @@ export async function purge(target: string, runsDirectory: string, evalDirectory
   }
   const auditDir = resolve("C:/vclip-data/audit"); await mkdir(auditDir, { recursive: true });
   await writeFile(join(auditDir, "purge.log"), `${new Date().toISOString()} purge_completed runs=${plan.runDirs.length} rating_rows=${removedRatings}\n`, { flag: "a", encoding: "utf8" });
-  return { deletedRuns: plan.runDirs.length, removedRatings };
+  return { deletedRuns: plan.runDirs.length, deletedKeys: plan.keyDirs.length, removedRatings };
 }
 
 function reviewHtml(runId: string, data: string): string { return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>vclip review — ${escapeHtml(runId)}</title><style>body{font:16px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#18212b;background:#f5f7fa}header,.clip{background:white;padding:1.25rem;border:1px solid #d7dee8;border-radius:10px;margin:1rem 0}.clip video{width:min(100%,560px);background:#111}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1rem}label{display:block;margin:.55rem 0}textarea,input[type=text]{width:100%;box-sizing:border-box;padding:.5rem}button{padding:.6rem 1rem;margin:.5rem .5rem .5rem 0;cursor:pointer}.rating label{display:inline-block;margin-right:1rem}small{color:#526171}</style><body><header><h1>Clip review: ${escapeHtml(runId)}</h1><p>Offline review sheet. Ratings stay in this browser until you download them.</p><label>Rater name/ID <input id="rater" type="text" autocomplete="off"></label><button id="download">Download ratings.csv</button></header><main id="clips"></main><script>const runId=${JSON.stringify(runId)},clips=${data};const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const root=document.getElementById('clips');for(const c of clips){const section=document.createElement('section');section.className='clip';section.innerHTML='<h2>'+esc(c.title)+'</h2><video controls preload="metadata" src="'+esc(c.video)+'"></video><p><b>Source:</b> '+c.start.toFixed(2)+'–'+c.end.toFixed(2)+'s</p><p><b>Reason:</b> '+esc(c.reason)+'</p><p><b>Transcript:</b> '+esc(c.transcript)+'</p><p><b>Critic:</b> '+esc(c.verdict)+' — '+esc(c.criticReason)+'</p><p><b>Context line required:</b> '+(c.needsContext?'Yes'+(c.contextLine?' — '+esc(c.contextLine):''):'No')+'</p><div class="rating"><b>Rating:</b>'+['yes_as_is','yes_minor_edits','no'].map(v=>'<label><input type="radio" name="rating-'+esc(c.id)+'" value="'+v+'"> '+v+'</label>').join('')+'</div><div class="grid"><label>Would post?<select data-field="would_post"><option value="">Select</option><option>yes</option><option>no</option></select></label><label><input type="checkbox" data-field="edited_before_posting"> Edited before posting</label></div><label>Notes<textarea data-field="notes" rows="3"></textarea></label></section>';root.append(section)}document.getElementById('download').onclick=()=>{const rows=[${JSON.stringify(RATING_COLUMNS)}];for(const c of clips){const card=[...document.querySelectorAll('.clip')][clips.indexOf(c)],rating=card.querySelector('input[name="rating-'+CSS.escape(c.id)+'"]:checked')?.value||'',would=card.querySelector('[data-field="would_post"]').value,edited=card.querySelector('[data-field="edited_before_posting"]').checked?'true':'false',notes=card.querySelector('[data-field="notes"]').value;if(rating)rows.push([runId,c.id,document.getElementById('rater').value,rating,notes,would,edited])}const csv=rows.map(row=>row.map(v=> '"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\\r\\n')+'\\r\\n',blob=new Blob([csv],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='ratings.csv';a.click();URL.revokeObjectURL(a.href)};</script></body></html>`; }
