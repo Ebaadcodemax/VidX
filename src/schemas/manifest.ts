@@ -25,12 +25,12 @@ export const costRecordSchema = z.object({
   providerCalls: z.array(z.object({
     provider: z.string(),
     model: z.string(),
-    usage: z.record(z.string(), z.number().nonnegative()),
+    usage: z.record(z.string(), z.number().nonnegative().nullable()),
     estimatedCostUsd: z.number().nonnegative(),
   }).strict()),
   localProcessing: z.object({
     sourceDurationSeconds: z.number().nonnegative(),
-    audioExtractMs: z.number().nonnegative(),
+    audioExtractMs: z.number().nonnegative().optional(),
     note: z.string(),
   }).strict(),
 }).strict();

@@ -2,6 +2,7 @@ node_modules/
 dist/
 .venv/
 .venv-asr/
+.venv-asr-*/
 .cache/
 .hf-cache/
 local-models/

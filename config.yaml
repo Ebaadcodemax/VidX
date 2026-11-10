@@ -1,10 +1,50 @@
 runtime:
   maxRunCostUsd: 0.05
-  defaultOutputDirectory: runs
+  defaultOutputDirectory: 'C:/vclip-data/runs'
 
-# Provider prices are intentionally empty until a provider is selected and
-# its current published pricing has been reviewed. Add rates per model here.
-pricing: {}
+# Gemini token prices are conservative published standard-tier estimates for
+# spend reservation. Free-tier usage may have no charge; vclip cannot verify
+# billing state. Refresh these rates when provider pricing changes.
+pricing:
+  gemini:
+    gemini-3.5-transcribe:
+      audioUsdPerMinute: 0.005
+    gemini-3.8-flash:
+      inputUsdPerMillionTokens: 0.75
+      outputUsdPerMillionTokens: 3.75
 
 # Enable a model integration only after approval, credentials, and terms review.
 requiredEnv: []
+
+transcription:
+  providers:
+    - faster-whisper
+    - gemini
+  local:
+    pythonPath: .venv-asr/Scripts/python.exe
+    downloadDirectory: 'C:/vclip-data/models'
+    model: small
+    device: cpu
+    computeType: int8
+    cpuThreads: 8
+  gemini:
+    model: gemini-3.5-transcribe
+    apiKeyEnv: GEMINI_API_KEY
+    creatorConsentEnv: GEMINI_CREATOR_CONSENT
+    unpaidDataUseAckEnv: GEMINI_UNPAID_DATA_USE_ACK
+    freeTierOnlyEnv: GEMINI_FREE_TIER_ONLY
+    maxTimestampMinutes: 30
+
+reasoner:
+  provider: gemini
+  model: gemini-3.8-flash
+  apiKeyEnv: GEMINI_API_KEY
+  creatorConsentEnv: GEMINI_CREATOR_CONSENT
+  unpaidDataUseAckEnv: GEMINI_UNPAID_DATA_USE_ACK
+  freeTierOnlyEnv: GEMINI_FREE_TIER_ONLY
+  maxOutputTokens: 2048
+  timeoutMs: 120000
+  maxClips: 8
+  minClipSeconds: 15
+  maxClipSeconds: 90
+  endPaddingSeconds: 0.3

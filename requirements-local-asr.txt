@@ -1,0 +1,4 @@
+faster-whisper==1.2.1
+ctranslate2==4.8.5
+# PyAV 15 retains metadata_errors and provides a Python 3.13 Windows wheel.
+av==15.1.0

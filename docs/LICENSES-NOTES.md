@@ -14,6 +14,10 @@ installed versions for this checkout.
 | @types/node | Node.js declarations | MIT |
 | Vitest | Test runner | MIT |
 | tsx | Local TypeScript runner | MIT |
+| faster-whisper 1.2.1 | Local speech-to-text model runtime | MIT; local inference only |
+| ctranslate2 4.8.5 | Local optimized inference | MIT |
+| av 15.1.0 | Audio decoding used by Faster-Whisper | BSD-3-Clause |
+| Gemini API | Optional hosted speech transcription | Google service terms apply. Gemini is not an installed dependency. Audio is uploaded only when all explicit environment gates are true; review current terms, retention, privacy, and pricing before enabling. |
 | FFmpeg/FFprobe | Local media probe and audio extraction | System-installed build; inspect its build configuration. FFmpeg is LGPL by default and includes optional GPL components. The available local Gyan build reports `libx264`; this is acceptable for local pilot use per the build brief, but review the exact build and codec obligations before distributing a bundled product. Do not redistribute this system binary from this project. |
 
-No paid dependency or hosted service is used by M1. Model provider pricing is not configured; do not guess rates. Add reviewed provider/model rates to `config.yaml` only after founder approval.
+M2 has no paid package dependency. Local Faster-Whisper inference has no per-call provider charge (hardware, energy, model downloads and processing time still have costs). Gemini is optional and uses a conservative configured standard-tier estimate for spend protection; the estimate is not a billing assertion, and the app cannot verify that the Google project is limited to its free tier. Do not enable hosted transcription until the creator has consented and data-use terms have been reviewed.
