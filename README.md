@@ -73,6 +73,20 @@ The reasoner uses the same three Gemini consent/free-tier flags as transcription
 
 The default model remains `gemini-3.8-flash`. If it returns repeated capacity errors, a one-run override such as `--model gemini-3.6-flash` is allowed only when that model has a configured price. The selected model and reason are written to `planning.json`; the default setting is not changed.
 
+## Rendering (M4)
+
+Render only from the original source video, validated M3 `edit_ir.json`, and its matching M2 `transcript.json`:
+
+```powershell
+npm run cli -- render "C:\vclip-data\sample5min.mp4" "C:\vclip-data\runs\my-plan\edit_ir.json" "C:\vclip-data\runs\my-transcription\transcript.json" --out "C:\vclip-data\runs\my-render"
+```
+
+Before rendering, vclip validates the Edit IR and transcript and checks that both source hashes and durations match the supplied video. Output is one MP4 per accepted clip under `clips/`, with matching ASS caption files. FFmpeg applies a centered 9:16 crop, burns captions using transcript word times, and encodes H.264 video with AAC audio. It does not track faces. FFprobe verifies H.264, 1080x1920 square-pixel output, AAC, and duration within 0.35 seconds.
+
+Each render directory contains `render.json`, `cost.json`, and `ffmpeg-commands.jsonl`. If a command or output check fails, vclip writes `failure.json` and `ffmpeg-partial.log` and preserves completed clips and command records. Local FFmpeg has no paid service charge; CPU time and electricity are not priced. Rendering uses a fixed encoder configuration and strips source metadata to keep identical inputs and settings byte-for-byte deterministic on the same FFmpeg build.
+
+This Windows setup uses the installed Nirmala UI system font, which covers Latin and Devanagari; the project does not bundle the font. Rendering is currently configured and tested on Windows; other operating systems need a platform-specific font path and family configuration before rendering.
+
 ## Config and cost accounting
 
 `config.yaml` sets a low default run cap and stores reviewed Gemini standard-tier estimates for transcription and reasoning. The default cap is `$0.05` per run. Hosted transcription preflights its estimate before audio upload; clip planning reserves estimated token cost before each model call. Local CPU time is reported but priced at zero. Update rates after checking current provider prices; cost estimates are not invoices.
@@ -88,4 +102,4 @@ Tests create a short synthetic video with FFmpeg in a temporary directory; they 
 
 ## Current boundary
 
-This local CLI now covers probing, transcription, clip proposal, critic review, validation and boundary snapping. It does not render clips (M4), build the review/evaluation tools, implement Creator DNA, access social platforms, generate visuals, provide an editor timeline, or run as a hosted service. Use only media you own or have written permission to process.
+This local CLI now covers probing, transcription, clip proposal, critic review, validation, boundary snapping, and M4 clip rendering. It does not build the review/evaluation tools, implement Creator DNA, access social platforms, generate visuals, provide an editor timeline, or run as a hosted service. Use only media you own or have written permission to process.

@@ -8,6 +8,7 @@ import { runCompareAsr, runSingleTranscription } from "../pipeline/transcribe";
 import type { TranscriberId } from "../adapters/transcriber";
 import { costRecordSchema } from "../schemas/manifest";
 import { runClipPlanning } from "../pipeline/plan-clips";
+import { runRendering } from "../pipeline/render";
 
 const program = new Command();
 program
@@ -126,6 +127,23 @@ program.command("plan")
     console.log(`Accepted clips: ${result.clips.length}`);
     for (const clip of result.clips) console.log(`${clip.id} ${clip.start_s.toFixed(3)}-${clip.end_s.toFixed(3)}s: ${clip.reason}`);
     console.log("M3 does not render video clips.");
+  });
+
+program.command("render")
+  .description("Render validated Edit IR clips as captioned 9:16 H.264/AAC videos (M4)")
+  .argument("<source-video>", "Original local source video used for planning")
+  .argument("<edit-ir>", "Validated M3 edit_ir.json")
+  .argument("<transcript>", "Matching M2 transcript.json with word timestamps")
+  .option("--out <directory>", "New output directory; defaults to config.yaml setting")
+  .action(async (sourceVideo: string, editIr: string, transcript: string, options: { out?: string }) => {
+    const config = await loadConfig();
+    const output = options.out ?? join(config.runtime.defaultOutputDirectory, `render_${Date.now()}`);
+    const result = await runRendering(sourceVideo, editIr, transcript, output);
+    console.log(`Render complete: ${result.runDirectory}`);
+    for (const clip of result.clips) {
+      console.log(`${clip.id}: ${clip.videoPath}; ${clip.probe.streams.find((stream) => stream.codec_type === "video")?.width}x${clip.probe.streams.find((stream) => stream.codec_type === "video")?.height}; ${clip.durationSeconds.toFixed(3)}s; ${clip.elapsedMs}ms`);
+    }
+    console.log(`Elapsed: ${result.elapsedMs}ms; estimated direct service cost: $${result.estimatedCostUsd.toFixed(6)}`);
   });
 
 program.parseAsync(process.argv).catch((error: unknown) => {

@@ -14,6 +14,7 @@ const ffprobeOutputSchema = z.object({
     codec_name: z.string().optional(),
     width: z.number().optional(),
     height: z.number().optional(),
+    sample_aspect_ratio: z.string().optional(),
     sample_rate: z.string().optional(),
     channels: z.number().optional(),
     avg_frame_rate: z.string().optional(),
